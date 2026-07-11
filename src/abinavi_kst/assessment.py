@@ -28,6 +28,8 @@ reference). Internally the code is 0-based.
 
 from __future__ import annotations
 
+import time
+import warnings
 from dataclasses import dataclass
 from typing import Callable, Sequence
 
@@ -50,11 +52,17 @@ __all__ = [
 class AssessmentResult:
     """The output of a completed adaptive assessment.
 
+    Mirrors R's ``kmassess`` return value, which is a list with elements
+    ``state``, ``probs``, ``queried``, ``qtime``, ``utime``.
+
     Attributes
     ----------
     state
         Binary tuple of length ``n`` (one entry per item). ``1`` means
-        the diagnosed student state contains that item.
+        the diagnosed student state contains that item. When multiple
+        states tie for maximum probability, R's ``which(probs == max)``
+        returns several rows; this tuple is then those rows flattened in
+        row order (mirroring R).
     probs
         Either the *final* probability distribution over states (length
         ``N``) when ``probdev=False``, or a list of length
@@ -63,17 +71,19 @@ class AssessmentResult:
         ``probdev=True``.
     queried
         1-based item numbers, in the order they were asked.
-    terminated_early
-        ``True`` if the loop exited because it hit the runaway-guard
-        (``2 * n`` questions) without ever crossing the probability
-        threshold. The reported ``state`` is then the best guess from
-        the most recent posterior.
+    qtime
+        Average wall-clock time (seconds) spent selecting a question,
+        mirroring R's ``qtime``. Nondeterministic; present for API parity.
+    utime
+        Average wall-clock time (seconds) spent updating probabilities,
+        mirroring R's ``utime``. Nondeterministic; present for API parity.
     """
 
     state: tuple[int, ...]
     probs: np.ndarray | list[np.ndarray]
     queried: tuple[int, ...]
-    terminated_early: bool
+    qtime: float
+    utime: float
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +230,12 @@ def bayesian_update(
         raise ValueError("beta entries must lie in [0, 1].")
     if eta_v.min() < 0 or eta_v.max() > 1:
         raise ValueError("eta entries must lie in [0, 1].")
+    if np.any(beta_v + eta_v > 1):
+        warnings.warn(
+            "beta_q + eta_q should be less than 1 for all items q.",
+            UserWarning,
+            stacklevel=2,
+        )
     if response not in (0, 1):
         raise ValueError("response must be 0 or 1.")
     if not 1 <= item <= n:
@@ -258,7 +274,7 @@ def simplified_assessment(
     rng: np.random.Generator | None = None,
     prior: np.ndarray | None = None,
     probdev: bool = False,
-) -> AssessmentResult:
+) -> AssessmentResult | None:
     """Run the full half-split + Bayesian adaptive assessment loop.
 
     Ports the iteration in ``kmassess.R`` lines 144–259 with the
@@ -301,12 +317,10 @@ def simplified_assessment(
         )
     if not np.array_equal(responses, responses.astype(bool).astype(responses.dtype)):
         raise ValueError("responses must be a binary vector.")
-    if not 0.0 < threshold <= 1.0:
-        raise ValueError("threshold must lie in (0, 1].")
+    if threshold < 0 or threshold > 1:
+        raise ValueError("Threshokd must be between 0 and 1.")
     if threshold <= 0.5:
-        # R issues a warning; we'd rather be strict because <=0.5 invites
-        # ties at the stopping condition.
-        raise ValueError("threshold should be > 0.5 for unequivocal results.")
+        warnings.warn("Threshold shoud be larger than 0.5!", UserWarning, stacklevel=2)
 
     n_states, n_items = ks.shape
     if prior is None:
@@ -319,26 +333,49 @@ def simplified_assessment(
 
     queried: list[int] = []
     problist: list[np.ndarray] = [probs.copy()]
-    terminated_early = False
+    qtimes: list[float] = []
+    utimes: list[float] = []
 
     while probs.max() <= threshold:
-        if len(queried) >= 2 * n_items:
-            terminated_early = True
-            break
+        t0 = time.perf_counter()
         item = halfsplit_question(probs, ks, rng)
+        qtimes.append(time.perf_counter() - t0)
         queried.append(item)
+        # R appends the question, then checks the guard (kmassess.R:223-229).
+        if len(queried) > 2 * n_items:
+            warnings.warn(
+                "Reached twice of number of items as number of questions!",
+                UserWarning,
+                stacklevel=2,
+            )
+            warnings.warn(
+                f"Question sequence: {', '.join(str(q) for q in queried)}",
+                UserWarning,
+                stacklevel=2,
+            )
+            return None
         response = int(responses[item - 1])
+        t1 = time.perf_counter()
         probs = bayesian_update(probs, ks, beta, eta, item, response)
+        utimes.append(time.perf_counter() - t1)
         problist.append(probs.copy())
 
-    state_index = int(np.argmax(probs))  # R uses first-max via which()
-    state = tuple(int(x) for x in ks[state_index])
+    # R: which(probs == max(probs)) — may be multiple indices; state is the
+    # ks rows at those indices. R's as.integer(ks[winners, ]) flattens a
+    # matrix column-major, so we mirror that with order="F".
+    max_val = probs.max()
+    winners = np.flatnonzero(probs == max_val)
+    if winners.size == 1:
+        state = tuple(int(x) for x in ks[winners[0]])
+    else:
+        state = tuple(int(x) for x in ks[winners].reshape(-1, order="F"))
 
     return AssessmentResult(
         state=state,
         probs=problist if probdev else probs,
         queried=tuple(queried),
-        terminated_early=terminated_early,
+        qtime=(sum(qtimes) / len(qtimes)) if qtimes else 0.0,
+        utime=(sum(utimes) / len(utimes)) if utimes else 0.0,
     )
 
 
@@ -356,7 +393,7 @@ def interactive_assessment(
     threshold: float = 0.51,
     rng: np.random.Generator | None = None,
     prior: np.ndarray | None = None,
-) -> AssessmentResult:
+) -> AssessmentResult | None:
     """Run the adaptive loop, calling ``respond(item)`` for each question.
 
     Mirrors ``simplified_assessment`` but takes a callable that produces
@@ -365,6 +402,9 @@ def interactive_assessment(
     a function. Production use cases drive the primitives
     (``halfsplit_question`` + ``bayesian_update``) directly from a web
     request loop.
+
+    Returns ``None`` if the runaway guard trips (``2 * n`` questions without
+    crossing the threshold), mirroring R's ``kmassess``.
     """
     _validate_ks(ks)
     n_states, n_items = ks.shape
@@ -378,22 +418,44 @@ def interactive_assessment(
 
     queried: list[int] = []
     problist: list[np.ndarray] = [probs.copy()]
-    terminated_early = False
+    qtimes: list[float] = []
+    utimes: list[float] = []
 
     while probs.max() <= threshold:
-        if len(queried) >= 2 * n_items:
-            terminated_early = True
-            break
+        t0 = time.perf_counter()
         item = halfsplit_question(probs, ks, rng)
+        qtimes.append(time.perf_counter() - t0)
         response = respond(item)
         if response not in (0, 1):
             raise ValueError(f"respond({item}) must return 0 or 1, got {response!r}.")
         queried.append(item)
+        if len(queried) > 2 * n_items:
+            warnings.warn(
+                "Reached twice of number of items as number of questions!",
+                UserWarning,
+                stacklevel=2,
+            )
+            warnings.warn(
+                f"Question sequence: {', '.join(str(q) for q in queried)}",
+                UserWarning,
+                stacklevel=2,
+            )
+            return None
+        t1 = time.perf_counter()
         probs = bayesian_update(probs, ks, beta, eta, item, response)
+        utimes.append(time.perf_counter() - t1)
         problist.append(probs.copy())
 
-    state_index = int(np.argmax(probs))
-    state = tuple(int(x) for x in ks[state_index])
+    max_val = probs.max()
+    winners = np.flatnonzero(probs == max_val)
+    if winners.size == 1:
+        state = tuple(int(x) for x in ks[winners[0]])
+    else:
+        state = tuple(int(x) for x in ks[winners].reshape(-1, order="F"))
     return AssessmentResult(
-        state=state, probs=probs, queried=tuple(queried), terminated_early=terminated_early
+        state=state,
+        probs=probs,
+        queried=tuple(queried),
+        qtime=(sum(qtimes) / len(qtimes)) if qtimes else 0.0,
+        utime=(sum(utimes) / len(utimes)) if utimes else 0.0,
     )

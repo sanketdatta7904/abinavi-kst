@@ -6,3 +6,7 @@ __pycache__/
 dist/
 build/
 .DS_Store
+
+# Generated R reference fixtures — regenerate with:
+#   Rscript tests/r_reference/generate_fixtures.R
+tests/fixtures/
