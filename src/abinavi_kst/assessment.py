@@ -62,7 +62,8 @@ class AssessmentResult:
         the diagnosed student state contains that item. When multiple
         states tie for maximum probability, R's ``which(probs == max)``
         returns several rows; this tuple is then those rows flattened in
-        row order (mirroring R).
+        column-major (Fortran) order, mirroring R's
+        ``as.integer(ks[winners, ])``.
     probs
         Either the *final* probability distribution over states (length
         ``N``) when ``probdev=False``, or a list of length
